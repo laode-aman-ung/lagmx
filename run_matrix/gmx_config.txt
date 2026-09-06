@@ -34,6 +34,15 @@ forcefield: amber03
 # Water model for pdb2gmx
 water: tip3p
 
+# Hydrogen Mass Repartitioning (pdb2gmx -heavyh): moves mass from heavy atoms
+# into their bonded hydrogens, stabilizing a 4 fs timestep (requires
+# constraints=all-bonds in *.mdp) instead of the usual 2 fs (h-bonds)
+# ceiling -- roughly doubles production throughput. Only applied to the
+# receptor via pdb2gmx; ligand topologies (antechamber/tleap) are unaffected,
+# which is fine since LINCS with all-bonds constrains every ligand bond
+# regardless of atom mass, and water uses SETTLE rather than LINCS.
+heavy_hydrogens: no
+
 # Name of the merged Protein+ligand index group used in mdp tc-grps
 merged_group: Protein_LIG
 
@@ -75,6 +84,13 @@ seqres_reference:
 #     bawaan md.mdp, selalu mulai dari 0 ns).
 production_ns: 5
 
+# Stop after NPT equilibration and skip the production mdrun entirely.
+# Useful to prepare systems (prep+EM+NVT+NPT, all cheap and short) ahead of
+# time and defer the expensive, timed production run until the machine is
+# actually idle -- set to "no" and re-run to resume automatically from the
+# existing NPT checkpoint straight into production.
+skip_production: no
+
 # ---------------------------------------------------------------------------
 # Analisis pasca-produksi (analyze_md.py)
 #
@@ -110,6 +126,46 @@ analysis_contact_cutoff: 0.4
 # gmx mana yang dipakai untuk analisis. Boleh berbeda dari gmx yang dipakai
 # menjalankan simulasi — analisis tidak butuh GPU, jadi build apa pun cukup.
 analysis_gmx: gmx
+
+# Penjarangan frame per analisis: pakai satu frame dari setiap N. Nilai 1
+# berarti semua frame dipakai.
+#
+# Setiap alat analisis gmx berjalan satu thread dan membaca lintasan dari awal
+# sampai akhir — tidak ada opsi -nt untuk dilempari core. Jadi biayanya sebanding
+# dengan jumlah frame, dan tidak dengan apa pun yang lain. Produksi 100 ns yang
+# ditulis tiap 2 ps menghasilkan 45.000 frame; pada satu kompleks ThiM nyata itu
+# berarti 5,4 jam untuk empat analisis, 3,4 jam di antaranya hanya untuk SASA.
+#
+# Penjarangan bukan jalan pintas, melainkan pernyataan tentang skala waktu tiap
+# besaran. Frame berjarak 2 ps sangat berkorelasi: hampir sampel yang sama
+# dihitung berulang, jadi menambah waktu tanpa menambah informasi. Nilai bawaan
+# di bawah ini mengikuti dua hal — berapa mahal analisisnya, dan skala waktu apa
+# yang sebenarnya bisa ia lihat.
+#
+# rmsd, rmsf, rg  murah (10–19 menit); menjarangkan menghemat sedikit sekali,
+#                 sementara ketiganya justru dibaca frame demi frame.
+analysis_stride_rmsd: 1
+analysis_stride_rmsf: 1
+analysis_stride_rg: 1
+# sasa            paling mahal. Luas permukaan terpapar pelarut berubah lambat;
+#                 4.500 sampel sepanjang 90 ns sudah menampilkan segalanya.
+analysis_stride_sasa: 10
+# hbond           hanya statistik okupansi — skrip meminta -num saja, tidak
+#                 pernah lifetime atau autokorelasi. Tetap dibuat lebih halus
+#                 dari sasa karena ikatan hidrogen putus-sambung pada skala
+#                 ps–ns dan bentuk kurvanya perlu terjaga. Menaikkan nilai ini
+#                 aman hanya selama belum ada analisis lifetime.
+analysis_stride_hbond: 5
+# contacts        okupansi per residu adalah sebuah fraksi; 4.500 frame menekan
+#                 galat bakunya jauh di bawah satu persen.
+analysis_stride_contacts: 10
+# pca             kovarians butuh sampel independen, dan frame 2 ps bukan itu.
+#                 Penjarangan memperbaiki kondisi matriksnya, bukan merusaknya,
+#                 sekaligus mengecilkan eigenvec.trr dengan faktor yang sama.
+analysis_stride_pca: 10
+# fel             tidak ada di sini: gmx sham membin proyeksi PCA dan tidak
+#                 pernah membuka lintasan, jadi ia mewarisi penjarangan pca.
+# mmpbsa          punya knob sendiri, mmpbsa_interval, dengan alasan yang sama.
 
 # gmx_MMPBSA hidup di environment terpisah karena menarik AmberTools versi
 # sendiri. Isi dengan salah satu dari: prefix environment conda, interpreter

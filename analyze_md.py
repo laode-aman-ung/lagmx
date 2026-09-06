@@ -28,6 +28,12 @@ Analyses
     fel       free energy landscape over PC1/PC2
     mmpbsa    binding free energy via gmx_MMPBSA (MM/GBSA and/or MM/PBSA)
 
+Every one of these except fel reads the trajectory front to back on a single
+core -- gmx analysis tools have no -nt -- so each has its own frame stride,
+analysis_stride_<name>, set in frames. The defaults are not uniform because the
+analyses are not: see the comment above STRIDABLE for what each costs and what
+timescale it actually resolves.
+
 Configuration comes from gmx_config.txt; see ANALYSIS_DEFAULTS below for the
 keys this script adds. All of them are optional.
 """
@@ -53,6 +59,17 @@ ANALYSIS_DEFAULTS = {
     "analysis_skip_ns": "0",          # drop this much from the start of the run
     "analysis_contact_cutoff": "0.4",  # nm, protein-ligand contact definition
     "analysis_gmx": "gmx",            # which gmx to analyse with
+    # Frame stride per analysis: use one frame in every N, 1 meaning every
+    # frame. The comment above STRIDABLE explains why each default is what it
+    # is. fel has no entry because gmx sham bins the PCA projection rather than
+    # reading the trajectory, so it inherits whatever stride pca used.
+    "analysis_stride_rmsd": "1",
+    "analysis_stride_rmsf": "1",
+    "analysis_stride_rg": "1",
+    "analysis_stride_sasa": "10",
+    "analysis_stride_hbond": "5",
+    "analysis_stride_contacts": "10",
+    "analysis_stride_pca": "10",
     "mmpbsa_python": "",              # env holding gmx_MMPBSA; empty = disabled
     "mmpbsa_method": "gb",            # gb, pb, or both
     "mmpbsa_frames": "100",           # target frame count, if no interval given
@@ -62,6 +79,42 @@ ANALYSIS_DEFAULTS = {
 }
 
 ALL_ANALYSES = ["rmsd", "rmsf", "rg", "sasa", "hbond", "contacts", "pca", "fel", "mmpbsa"]
+
+# Analyses whose stride is configurable, i.e. the ones that read the trajectory.
+STRIDABLE = ["rmsd", "rmsf", "rg", "sasa", "hbond", "contacts", "pca"]
+
+# Why the defaults differ. Every gmx analysis tool is single-threaded and reads
+# the trajectory front to back, so cost is proportional to frame count and to
+# nothing else -- there is no -nt to throw cores at. A 100 ns run written every
+# 2 ps is 45000 frames, and on a real ThiM complex that cost 5.4 h for four
+# analyses, of which SASA alone was 3.4 h.
+#
+# Striding is not a shortcut, it is a statement about which timescale each
+# quantity lives on. Frames 2 ps apart are strongly correlated: they are close
+# to the same sample counted many times, so they cost time without adding
+# information. The defaults follow from that, plus from what each analysis
+# actually costs:
+#
+#   rmsd, rmsf, rg   1   Cheap (10-19 min each). Striding would save little and
+#                        these are the traces people read frame by frame.
+#   sasa            10   By far the most expensive. Solvent-accessible surface
+#                        is a slowly varying geometric quantity; 4500 samples
+#                        over 90 ns resolve everything it can show.
+#   hbond            5   Occupancy statistics only -- this script asks gmx hbond
+#                        for -num and never for lifetimes or autocorrelation, so
+#                        no result here needs 2 ps resolution. Kept finer than
+#                        sasa because hydrogen bonds do break and reform on a
+#                        ps-ns timescale and the count trace should keep its
+#                        shape. Raising this is safe only while no lifetime
+#                        analysis is added.
+#   contacts        10   Per-residue occupancy is a fraction; 4500 frames put
+#                        its standard error well under one percent.
+#   pca             10   Covariance wants independent samples, which 2 ps frames
+#                        are not. Striding improves the conditioning rather than
+#                        harming it, and shrinks eigenvec.trr by the same factor.
+#   fel                  Not listed: gmx sham bins the PCA projection and never
+#                        opens the trajectory, so it inherits pca's stride.
+#   mmpbsa               Has its own knob, mmpbsa_interval, for the same reason.
 
 GMX = "gmx"
 
@@ -244,6 +297,51 @@ def build_index(tpr, out_ndx, workdir, merged_group="Protein_LIG"):
 # trajectory preparation
 # --------------------------------------------------------------------------
 
+def frame_interval_ps(cdir):
+    """Time between stored frames, read from the production .mdp.
+
+    There is no cheap way to ask gmx: every tool that reports frame times reads
+    the whole trajectory, which on a 12 GB file is exactly the cost striding
+    exists to avoid. nstxout-compressed * dt is what produced the interval in
+    the first place, so take it from there. Returns 0.0 if it cannot be read,
+    which disables striding rather than guessing.
+    """
+    mdp = os.path.join(cdir, "md.mdp")
+    if not os.path.exists(mdp):
+        return 0.0
+    nst, dt = None, None
+    for line in open(mdp, errors="replace"):
+        line = line.split(";", 1)[0]
+        if "=" not in line:
+            continue
+        key, value = (part.strip() for part in line.split("=", 1))
+        key = key.lower().replace("_", "-")
+        try:
+            if key == "nstxout-compressed":
+                nst = int(float(value.split()[0]))
+            elif key == "dt":
+                dt = float(value.split()[0])
+        except (ValueError, IndexError):
+            continue
+    if not nst or not dt:
+        return 0.0
+    return nst * dt
+
+
+def stride_args(ctx, key):
+    """gmx's -dt flag for one analysis, or nothing if it keeps every frame.
+
+    gmx takes a time, not a frame count, so a stride of N frames is N times the
+    interval between them. Configuration is in frames because that is the unit
+    the user reasons in and the unit mmpbsa_interval already uses.
+    """
+    stride = ctx["strides"].get(key, 1)
+    interval = ctx["frame_ps"]
+    if stride <= 1 or interval <= 0:
+        return []
+    return ["-dt", f"{stride * interval:g}"]
+
+
 def prepare_trajectory(cdir, adir, tpr, xtc, groups, merged_group, skip_ps):
     """Undo periodic boundary artefacts before anything is measured.
 
@@ -251,6 +349,13 @@ def prepare_trajectory(cdir, adir, tpr, xtc, groups, merged_group, skip_ps):
     jumping between images, then centre the complex in a compact box. Skipping
     this is the classic way to get an RMSD trace with a cliff in it that looks
     like unbinding and is really the ligand crossing the box edge.
+
+    The result is reused if one is already here for the same source trajectory
+    and the same analysis_skip_ns. Three passes over a 12 GB .xtc is an hour
+    that should not be spent again just because a stride was changed -- and
+    striding is per analysis, so it does not affect this file at all. The stamp
+    records what the existing file was built from, so a changed skip_ns or a
+    re-run production rebuilds it rather than being silently reused.
     """
     system = groups.get("System", 0)
     centre = groups.get(merged_group, groups.get("Protein", 1))
@@ -258,6 +363,14 @@ def prepare_trajectory(cdir, adir, tpr, xtc, groups, merged_group, skip_ps):
     whole = os.path.join(adir, "_whole.xtc")
     nojump = os.path.join(adir, "_nojump.xtc")
     final = os.path.join(adir, "md_center.xtc")
+    start = os.path.join(adir, "start.pdb")
+    stamp = os.path.join(adir, "md_center.stamp")
+
+    built_from = f"skip_ps={skip_ps:g} centre={centre} src_mtime={os.path.getmtime(xtc):.0f}"
+    if os.path.exists(final) and os.path.exists(start) and os.path.exists(stamp):
+        if open(stamp, errors="replace").read().strip() == built_from:
+            say("prepared trajectory reused", 6)
+            return final
 
     steps = [
         (["trjconv", "-s", tpr, "-f", xtc, "-o", whole, "-pbc", "whole"], f"{system}\n"),
@@ -280,9 +393,14 @@ def prepare_trajectory(cdir, adir, tpr, xtc, groups, merged_group, skip_ps):
             os.remove(tmp)
 
     # A single reference frame, used as the -s for analyses and for viewing.
-    gmx_run(["trjconv", "-s", tpr, "-f", final, "-o", os.path.join(adir, "start.pdb"),
+    gmx_run(["trjconv", "-s", tpr, "-f", final, "-o", start,
              "-n", os.path.join(adir, "analysis.ndx"), "-dump", "0"],
             stdin=f"{system}\n", cwd=cdir)
+
+    # Written last, so an interrupted preparation leaves no stamp to trust.
+    if os.path.exists(start):
+        with open(stamp, "w") as fh:
+            fh.write(built_from + "\n")
     return final
 
 
@@ -342,8 +460,9 @@ def analyse_rmsd(ctx):
     if backbone is None:
         return results
 
+    step = stride_args(ctx, "rmsd")
     ok, _ = gmx_run(["rms", "-s", ctx["tpr"], "-f", ctx["xtc"], "-n", ctx["ndx"],
-                     "-o", ctx["a"]("rmsd_protein.xvg"), "-tu", "ns"],
+                     "-o", ctx["a"]("rmsd_protein.xvg"), "-tu", "ns"] + step,
                     stdin=f"{backbone}\n{backbone}\n", cwd=ctx["cdir"])
     if ok:
         data, meta = read_xvg(ctx["a"]("rmsd_protein.xvg"))
@@ -355,7 +474,7 @@ def analyse_rmsd(ctx):
     ligand = ctx["groups"].get("Other")
     if ligand is not None:
         ok, _ = gmx_run(["rms", "-s", ctx["tpr"], "-f", ctx["xtc"], "-n", ctx["ndx"],
-                         "-o", ctx["a"]("rmsd_ligand.xvg"), "-tu", "ns"],
+                         "-o", ctx["a"]("rmsd_ligand.xvg"), "-tu", "ns"] + step,
                         stdin=f"{backbone}\n{ligand}\n", cwd=ctx["cdir"])
         if ok:
             data, meta = read_xvg(ctx["a"]("rmsd_ligand.xvg"))
@@ -372,7 +491,8 @@ def analyse_rmsf(ctx):
     if ca is None:
         return {}
     ok, _ = gmx_run(["rmsf", "-s", ctx["tpr"], "-f", ctx["xtc"], "-n", ctx["ndx"],
-                     "-o", ctx["a"]("rmsf.xvg"), "-oq", ctx["a"]("rmsf_bfactor.pdb"), "-res"],
+                     "-o", ctx["a"]("rmsf.xvg"), "-oq", ctx["a"]("rmsf_bfactor.pdb"),
+                     "-res"] + stride_args(ctx, "rmsf"),
                     stdin=f"{ca}\n", cwd=ctx["cdir"])
     if not ok:
         return {}
@@ -395,7 +515,8 @@ def analyse_rg(ctx):
         return {}
     for tool in ("gyrate", "gyrate-legacy"):
         ok, _ = gmx_run([tool, "-s", ctx["tpr"], "-f", ctx["xtc"], "-n", ctx["ndx"],
-                         "-o", ctx["a"]("rg.xvg")], stdin=f"{protein}\n", cwd=ctx["cdir"])
+                         "-o", ctx["a"]("rg.xvg")] + stride_args(ctx, "rg"),
+                        stdin=f"{protein}\n", cwd=ctx["cdir"])
         if ok:
             break
     else:
@@ -422,7 +543,8 @@ def analyse_sasa(ctx):
         jobs.append(("sasa_complex", 'group "Protein" or group "Other"'))
     for name, sel in jobs:
         ok, _ = gmx_run(["sasa", "-s", ctx["tpr"], "-f", ctx["xtc"], "-n", ctx["ndx"],
-                         "-surface", sel, "-o", ctx["a"](f"{name}.xvg")], cwd=ctx["cdir"])
+                         "-surface", sel, "-o", ctx["a"](f"{name}.xvg")]
+                        + stride_args(ctx, "sasa"), cwd=ctx["cdir"])
         if not ok:
             continue
         data, meta = read_xvg(ctx["a"](f"{name}.xvg"))
@@ -450,14 +572,16 @@ def analyse_hbond(ctx):
         return {}
     target = ctx["a"]("hbond_num.xvg")
 
+    step = stride_args(ctx, "hbond")
     ok, _ = gmx_run(["hbond", "-s", ctx["tpr"], "-f", ctx["xtc"], "-n", ctx["ndx"],
                      "-ref", 'group "Protein"', "-sel", 'group "Other"',
-                     "-num", target], cwd=ctx["cdir"])
+                     "-num", target] + step, cwd=ctx["cdir"])
     if not ok or not os.path.exists(target):
         protein, ligand = ctx["groups"]["Protein"], ctx["groups"]["Other"]
         for tool in ("hbond", "hbond-legacy"):
             ok, _ = gmx_run([tool, "-s", ctx["tpr"], "-f", ctx["xtc"], "-n", ctx["ndx"],
-                             "-num", target], stdin=f"{protein}\n{ligand}\n", cwd=ctx["cdir"])
+                             "-num", target] + step,
+                            stdin=f"{protein}\n{ligand}\n", cwd=ctx["cdir"])
             if ok and os.path.exists(target):
                 break
     if not os.path.exists(target):
@@ -502,7 +626,8 @@ def analyse_contacts(ctx):
     size_xvg, idx_dat = ctx["a"]("contacts_size.xvg"), ctx["a"]("contacts_index.dat")
 
     ok, _ = gmx_run(["select", "-s", ctx["tpr"], "-f", ctx["xtc"], "-n", ctx["ndx"],
-                     "-select", sel, "-os", size_xvg, "-oi", idx_dat], cwd=ctx["cdir"])
+                     "-select", sel, "-os", size_xvg, "-oi", idx_dat]
+                    + stride_args(ctx, "contacts"), cwd=ctx["cdir"])
     if not ok or not os.path.exists(idx_dat):
         return {}
 
@@ -566,9 +691,12 @@ def analyse_pca(ctx):
     if ca is None:
         return {}
     eigvec = ctx["a"]("eigenvec.trr")
+    # covar and anaeig must see the same frames: the projection is only
+    # meaningful against the covariance it came from.
+    step = stride_args(ctx, "pca")
     ok, _ = gmx_run(["covar", "-s", ctx["tpr"], "-f", ctx["xtc"], "-n", ctx["ndx"],
                      "-o", ctx["a"]("eigenval.xvg"), "-v", eigvec,
-                     "-av", ctx["a"]("average.pdb"), "-l", ctx["a"]("covar.log")],
+                     "-av", ctx["a"]("average.pdb"), "-l", ctx["a"]("covar.log")] + step,
                     stdin=f"{ca}\n{ca}\n", cwd=ctx["cdir"])
     if not ok:
         return {}
@@ -588,7 +716,7 @@ def analyse_pca(ctx):
 
     proj = ctx["a"]("pca_proj_1_2.xvg")
     ok, _ = gmx_run(["anaeig", "-v", eigvec, "-s", ctx["tpr"], "-f", ctx["xtc"],
-                     "-n", ctx["ndx"], "-first", "1", "-last", "2", "-2d", proj],
+                     "-n", ctx["ndx"], "-first", "1", "-last", "2", "-2d", proj] + step,
                     stdin=f"{ca}\n{ca}\n", cwd=ctx["cdir"])
     if ok and os.path.exists(proj):
         data, _ = read_xvg(proj)
@@ -858,10 +986,26 @@ def analyse_complex(cdir, cfg, requested):
     if not prepared:
         return None
 
+    frame_ps = frame_interval_ps(cdir)
+    strides = {}
+    for key in STRIDABLE:
+        try:
+            strides[key] = max(1, int(float(cfg.get(f"analysis_stride_{key}", "1"))))
+        except ValueError:
+            strides[key] = 1
+    thinned = {k: v for k, v in strides.items() if v > 1}
+    if thinned and frame_ps <= 0:
+        say("cannot read nstxout-compressed*dt from md.mdp; "
+            "analysing every frame instead of striding", 6)
+    elif thinned:
+        say("stride: " + ", ".join(f"{k} 1/{v}" for k, v in thinned.items())
+            + f" (frame {frame_ps:g} ps)", 6)
+
     ctx = {
         "cdir": cdir, "adir": adir, "tpr": tpr, "xtc": prepared,
         "ndx": os.path.join(adir, "analysis.ndx"), "groups": groups,
         "a": lambda f: os.path.join(adir, f),
+        "strides": strides, "frame_ps": frame_ps,
         "contact_cutoff": float(cfg["analysis_contact_cutoff"]),
         "mmpbsa_exe": _resolve_mmpbsa(cfg.get("mmpbsa_python", "").strip()),
         "mmpbsa_method": cfg.get("mmpbsa_method", "gb"),
