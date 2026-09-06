@@ -329,18 +329,27 @@ def frame_interval_ps(cdir):
     return nst * dt
 
 
-def stride_args(ctx, key):
+def stride_args(ctx, key, tu="ps"):
     """gmx's -dt flag for one analysis, or nothing if it keeps every frame.
 
     gmx takes a time, not a frame count, so a stride of N frames is N times the
     interval between them. Configuration is in frames because that is the unit
     the user reasons in and the unit mmpbsa_interval already uses.
+
+    `tu` must match the -tu the command is given, because -dt is interpreted in
+    whatever unit -tu selects -- not in ps. Getting this wrong is silent and
+    expensive: `gmx rms -tu ns -dt 10` was read as one frame per 10 ns rather
+    than per 10 ps, and a 90 ns trajectory came back as ten data points instead
+    of nine thousand. The file is valid, the plot draws, and nothing warns.
     """
     stride = ctx["strides"].get(key, 1)
     interval = ctx["frame_ps"]
     if stride <= 1 or interval <= 0:
         return []
-    return ["-dt", f"{stride * interval:g}"]
+    dt = stride * interval
+    if tu == "ns":
+        dt /= 1000.0
+    return ["-dt", f"{dt:g}"]
 
 
 def prepare_trajectory(cdir, adir, tpr, xtc, groups, merged_group, skip_ps):
@@ -461,7 +470,8 @@ def analyse_rmsd(ctx):
     if backbone is None:
         return results
 
-    step = stride_args(ctx, "rmsd")
+    # Both rms calls pass -tu ns, so -dt has to be in ns as well.
+    step = stride_args(ctx, "rmsd", tu="ns")
     ok, _ = gmx_run(["rms", "-s", ctx["tpr"], "-f", ctx["xtc"], "-n", ctx["ndx"],
                      "-o", ctx["a"]("rmsd_protein.xvg"), "-tu", "ns"] + step,
                     stdin=f"{backbone}\n{backbone}\n", cwd=ctx["cdir"])
