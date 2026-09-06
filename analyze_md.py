@@ -74,6 +74,7 @@ ANALYSIS_DEFAULTS = {
     "mmpbsa_method": "gb",            # gb, pb, or both
     "mmpbsa_frames": "100",           # target frame count, if no interval given
     "mmpbsa_interval": "",            # explicit frame stride; overrides the target
+    "mmpbsa_np": "1",                 # MPI ranks for gmx_MMPBSA; 1 = serial
     "mmpbsa_igb": "5",
     "mmpbsa_salt": "0.150",
 }
@@ -796,6 +797,24 @@ def _resolve_mmpbsa(setting):
     return None
 
 
+def _resolve_mpirun(mmpbsa_exe):
+    """mpirun from the same environment as gmx_MMPBSA, or None.
+
+    gmx_MMPBSA splits *frames* across MPI ranks, so this is the one knob that
+    makes it finish sooner. It was never used: the command was built without
+    mpirun at all, and one MM/GBSA pass over 181 frames took 98 minutes on a
+    machine with 40 idle cores.
+
+    The launcher has to come from gmx_MMPBSA's own environment. A system mpirun
+    against a conda-built mpi4py is the classic way to get ranks that each think
+    they are rank 0, which silently computes the same frames N times.
+    """
+    if not mmpbsa_exe:
+        return None
+    sibling = os.path.join(os.path.dirname(mmpbsa_exe), "mpirun")
+    return sibling if os.access(sibling, os.X_OK) else None
+
+
 def _frame_count(ctx):
     """Number of frames in the prepared trajectory, via the RMSD trace if it
     exists (cheap) and gmx check otherwise."""
@@ -896,7 +915,17 @@ def _run_one_mmpbsa(ctx, exe, label, group_num, total, interval, method):
            "-ct", ctx["xtc"], "-cp", "topol.top",
            "-o", ctx["a"](f"mmpbsa_{label}.dat"),
            "-eo", ctx["a"](f"mmpbsa_{label}.csv"), "-nogui"]
-    say(f"gmx_MMPBSA [{label}]: interval {interval}, metode {method}", 8)
+    # Frames are the unit of work, so more ranks than frames is waste.
+    nprocs = max(1, min(int(ctx.get("mmpbsa_np", 1) or 1), total))
+    if nprocs > 1:
+        launcher = _resolve_mpirun(exe)
+        if launcher:
+            cmd = [launcher, "-np", str(nprocs)] + cmd
+        else:
+            say("mpirun not found next to gmx_MMPBSA; running serial", 8)
+            nprocs = 1
+    say(f"gmx_MMPBSA [{label}]: interval {interval}, metode {method}, "
+        f"{nprocs} proses", 8)
     try:
         proc = subprocess.run(cmd, cwd=ctx["cdir"], capture_output=True,
                               text=True, env=env, timeout=86400)
@@ -1011,6 +1040,7 @@ def analyse_complex(cdir, cfg, requested):
         "mmpbsa_method": cfg.get("mmpbsa_method", "gb"),
         "mmpbsa_frames": int(cfg.get("mmpbsa_frames", "100")),
         "mmpbsa_interval": int(cfg.get("mmpbsa_interval") or 0),
+        "mmpbsa_np": int(cfg.get("mmpbsa_np", "1") or 1),
         "mmpbsa_igb": cfg.get("mmpbsa_igb", "5"),
         "mmpbsa_salt": cfg.get("mmpbsa_salt", "0.150"),
     }
