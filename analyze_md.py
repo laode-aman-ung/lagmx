@@ -252,6 +252,15 @@ def read_xpm(path):
 # index groups
 # --------------------------------------------------------------------------
 
+def _index_group_names(ndx_path):
+    """{group name: group number} read from an .ndx file.
+
+    Group numbers are positions in the file, which is how gmx numbers them.
+    """
+    names = re.findall(r"^\s*\[\s*(.+?)\s*\]", open(ndx_path, errors="replace").read(), re.M)
+    return {name: i for i, name in enumerate(names)}
+
+
 def build_index(tpr, out_ndx, workdir, merged_group="Protein_LIG"):
     """Write an index file and return {group name: group number}.
 
@@ -281,13 +290,19 @@ def build_index(tpr, out_ndx, workdir, merged_group="Protein_LIG"):
         # them fused in "Other" would report their sum as if it were one
         # binding event, and throw away the spread between the sites -- which
         # is the only internal check on how reproducible the number is.
-        ok, out3 = gmx_run(
+        ok, _ = gmx_run(
             ["make_ndx", "-f", tpr, "-n", out_ndx, "-o", out_ndx],
             stdin=f'splitres {groups["Other"]}\nq\n', cwd=workdir)
         if ok:
-            after = {name: int(num) for num, name in
-                     re.findall(r"^\s*(\d+)\s+(\S+)\s*:", out3, re.M)}
-            for name, num in after.items():
+            # Read the names back from the file, not from the command output.
+            # make_ndx lists its groups when it starts and then quits after the
+            # split without listing them again, so the new groups can never
+            # appear in what the command printed -- parsing that output found
+            # nothing, _ligan_terpisah stayed empty, and MM/PBSA silently fell
+            # back to treating every ligand copy as one lumped "ligand". On the
+            # ThiM trimer that meant a binding energy for three molecules at
+            # once, reported as if it were one.
+            for name, num in _index_group_names(out_ndx).items():
                 if name not in groups:
                     groups[name] = num
                     groups.setdefault("_ligan_terpisah", []).append(name)
@@ -352,13 +367,40 @@ def stride_args(ctx, key, tu="ps"):
     return ["-dt", f"{dt:g}"]
 
 
+# Identifies the PBC recipe in prepare_trajectory. Change it and every stored
+# md_center.stamp stops matching, so prepared trajectories are rebuilt instead
+# of silently reused with the treatment they were made under.
+#   1 = whole -> nojump -> mol/compact/center   (broke multimers)
+#   2 = whole -> cluster -> mol/compact/center
+PREP_RECIPE = 2
+
+
 def prepare_trajectory(cdir, adir, tpr, xtc, groups, merged_group, skip_ps):
     """Undo periodic boundary artefacts before anything is measured.
 
-    Three passes, in this order and no other: make molecules whole, stop them
-    jumping between images, then centre the complex in a compact box. Skipping
+    Three passes, in this order and no other: make molecules whole, gather the
+    complex into one periodic image, then centre it in a compact box. Skipping
     this is the classic way to get an RMSD trace with a cliff in it that looks
     like unbinding and is really the ligand crossing the box edge.
+
+    The middle pass is `-pbc cluster`, not `-pbc nojump`. nojump keeps each
+    molecule continuous in time relative to the first frame, which is right for
+    a single-chain protein and quietly wrong for a multimer: each protomer is
+    its own moleculetype, so they drift into different images and the assembly
+    comes apart. Measured on the ThiM trimer, whose three chains sit 32 A apart
+    in the input: after nojump they were 74, 80 and 34 A apart -- one protomer
+    displaced by roughly a box length -- in every one of 201 frames checked.
+    Adding cluster before nojump does not help, because nojump undoes it.
+
+    That break is invisible in the output and poisons everything computed on the
+    assembly as a whole: the backbone fit behind every RMSD, the radius of
+    gyration, the solvent-accessible surface (the A-B and A-C interfaces become
+    exposed), the C-alpha covariance behind PCA and FEL, and the receptor
+    MM/PBSA is handed. Per-site quantities -- contacts, hydrogen bonds -- survive,
+    because each ligand travels with its own chain.
+
+    With cluster in its place the same 201 frames hold at 32-33 A throughout,
+    and each ligand stays 13-15 A from its own protomer.
 
     The result is reused if one is already here for the same source trajectory
     and the same analysis_skip_ns. Three passes over a 12 GB .xtc is an hour
@@ -371,12 +413,18 @@ def prepare_trajectory(cdir, adir, tpr, xtc, groups, merged_group, skip_ps):
     centre = groups.get(merged_group, groups.get("Protein", 1))
 
     whole = os.path.join(adir, "_whole.xtc")
-    nojump = os.path.join(adir, "_nojump.xtc")
+    nojump = os.path.join(adir, "_clustered.xtc")
     final = os.path.join(adir, "md_center.xtc")
     start = os.path.join(adir, "start.pdb")
     stamp = os.path.join(adir, "md_center.stamp")
 
-    built_from = f"skip_ps={skip_ps:g} centre={centre} src_mtime={os.path.getmtime(xtc):.0f}"
+    # The stamp has to identify the pipeline, not just its inputs. It recorded
+    # only skip_ps, the centring group and the source mtime, so changing the PBC
+    # treatment left every existing stamp valid and the broken trajectories
+    # would have been reused in silence. Bump PREP_RECIPE whenever the steps
+    # below change.
+    built_from = (f"recipe={PREP_RECIPE} skip_ps={skip_ps:g} centre={centre} "
+                  f"src_mtime={os.path.getmtime(xtc):.0f}")
     if os.path.exists(final) and os.path.exists(start) and os.path.exists(stamp):
         if open(stamp, errors="replace").read().strip() == built_from:
             say("prepared trajectory reused", 6)
@@ -384,7 +432,10 @@ def prepare_trajectory(cdir, adir, tpr, xtc, groups, merged_group, skip_ps):
 
     steps = [
         (["trjconv", "-s", tpr, "-f", xtc, "-o", whole, "-pbc", "whole"], f"{system}\n"),
-        (["trjconv", "-s", tpr, "-f", whole, "-o", nojump, "-pbc", "nojump"], f"{system}\n"),
+        # Cluster on the same group the box is centred on, so every chain and
+        # every ligand copy is pulled into one image before centring.
+        (["trjconv", "-s", tpr, "-f", whole, "-o", nojump, "-pbc", "cluster"],
+         f"{centre}\n{system}\n"),
         (["trjconv", "-s", tpr, "-f", nojump, "-o", final,
           "-pbc", "mol", "-ur", "compact", "-center"], f"{centre}\n{system}\n"),
     ]
