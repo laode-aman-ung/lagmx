@@ -198,3 +198,42 @@ def test_analysis_defaults_cover_every_named_analysis():
     # The default list must be runnable without extra setup, so mmpbsa -- which
     # needs its own conda environment -- stays opt-in.
     assert "mmpbsa" not in am.ANALYSIS_DEFAULTS["analysis"].split(",")
+
+
+def test_mmpbsa_reads_the_delta_row_not_the_ligand(tmp_path):
+    """A .dat holds four TOTAL rows: complex, receptor, ligand, then the
+    difference. gmx_MMPBSA writes the last as "ΔTOTAL", one word. Matching
+    `(?:Delta\\s+)?TOTAL` caught the first three and missed the fourth, and
+    since each match overwrote the last, the ligand's own internal energy was
+    reported as the binding free energy -- positive, and ranking by ligand
+    size rather than by affinity."""
+    dat = tmp_path / "mmpbsa_Other_K13_258.dat"
+    dat.write_text(
+        "GENERALIZED BORN:\n"
+        "\n"
+        "Complex:\n"
+        "GGAS                  -5235.26        210.75\n"
+        "TOTAL                -10461.67        260.21\n"
+        "\n"
+        "Receptor:\n"
+        "TOTAL                -10497.29        259.70\n"
+        "\n"
+        "Ligand:\n"
+        "TOTAL                    70.81          5.51\n"
+        "\n"
+        "Delta (Complex - Receptor - Ligand):\n"
+        "ΔGGAS                   -50.71          1.17\n"
+        "ΔTOTAL                  -35.19          1.20\n"
+    )
+    am = _load_analyze_md()
+    out = am.parse_mmpbsa_dat(str(dat))
+    assert out["mmpbsa_gb_dG_kcal"] == -35.19, "must be ΔTOTAL, not a plain TOTAL"
+    assert out["mmpbsa_gb_sd"] == 1.20
+    # complex - receptor - ligand reproduces the delta, so the row is the
+    # binding energy and not one of the three absolute totals.
+    assert round(-10461.67 - (-10497.29) - 70.81, 2) == out["mmpbsa_gb_dG_kcal"]
+
+
+def test_mmpbsa_missing_file_is_empty_not_an_error():
+    am = _load_analyze_md()
+    assert am.parse_mmpbsa_dat("/nonexistent/mmpbsa.dat") == {}

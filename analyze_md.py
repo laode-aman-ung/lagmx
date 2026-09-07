@@ -1061,15 +1061,41 @@ def _run_one_mmpbsa(ctx, exe, label, group_num, total, interval, method):
         say(f"gmx_MMPBSA [{label}] failed: " + " | ".join(tail), 6)
         return {}
 
-    out, dat = {}, ctx["a"](f"mmpbsa_{label}.dat")
-    if os.path.exists(dat):
-        section = None
-        for line in open(dat, errors="replace"):
+    dat = ctx["a"](f"mmpbsa_{label}.dat")
+    return parse_mmpbsa_dat(dat) if os.path.exists(dat) else {}
+
+
+# Matches the delta row only. A .dat holds four TOTAL rows -- complex,
+# receptor, ligand, then the difference -- and gmx_MMPBSA writes the last as
+# "ΔTOTAL", one word, not "Delta TOTAL".
+_DELTA_TOTAL = re.compile(r"^\s*(?:Δ|DELTA\s+|Delta\s+)TOTAL\s+([-\d.]+)\s+([-\d.]+)")
+
+
+def parse_mmpbsa_dat(path):
+    """Binding free energy and its standard deviation from a gmx_MMPBSA .dat.
+
+    Returns {'mmpbsa_gb_dG_kcal', 'mmpbsa_gb_sd'} and/or the pb equivalents.
+
+    Only the ΔTOTAL row counts. The previous pattern, `(?:Delta\\s+)?TOTAL`,
+    matched the three plain TOTAL rows and missed the delta, and since each
+    match overwrote the last, what was reported as the binding free energy was
+    the ligand's own internal energy -- +70.81 kcal/mol where the answer was
+    -35.19. Wrong quantity, wrong sign, and nothing looked broken: those
+    numbers even ranked the candidates plausibly, because a ligand's internal
+    energy grows with its size.
+    """
+    out, section = {}, None
+    try:
+        fh = open(path, errors="replace")
+    except OSError:
+        return out
+    with fh:
+        for line in fh:
             if "GENERALIZED BORN" in line:
                 section = "gb"
             elif "POISSON BOLTZMANN" in line:
                 section = "pb"
-            m = re.match(r"^\s*(?:Delta\s+)?TOTAL\s+([-\d.]+)\s+([-\d.]+)", line)
+            m = _DELTA_TOTAL.match(line)
             if m and section:
                 out[f"mmpbsa_{section}_dG_kcal"] = float(m.group(1))
                 out[f"mmpbsa_{section}_sd"] = float(m.group(2))
