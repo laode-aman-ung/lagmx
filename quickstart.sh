@@ -101,7 +101,7 @@ if [ "$status" -eq 0 ] && [ "$missing" -eq 0 ]; then
 else
     echo "FAIL -- exit code $status. See $WORK/quickstart.log for the error."
     echo "If you think this is a bug, please open an issue and attach that log:"
-    echo "  https://github.com/laode-aman-ung/LAGMX/issues"
+    echo "  https://github.com/laode-aman-ung/lagmx/issues"
 fi
 echo "================================================="
 exit "$status"

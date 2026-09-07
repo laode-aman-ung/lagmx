@@ -1,8 +1,8 @@
 blank_issues_enabled: true
 contact_links:
   - name: Contribution guidelines
-    url: https://github.com/laode-aman-ung/LAGMX/blob/main/CONTRIBUTING.md
+    url: https://github.com/laode-aman-ung/lagmx/blob/main/CONTRIBUTING.md
     about: How to report bugs, propose changes, and add a test scenario.
   - name: Scope, evidence and limits
-    url: https://github.com/laode-aman-ung/LAGMX#scope-evidence-and-limits
+    url: https://github.com/laode-aman-ung/lagmx#scope-evidence-and-limits
     about: What LAGMX has been shown to do, and what it has not.

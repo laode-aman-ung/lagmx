@@ -12,7 +12,7 @@ Penggantian nama `pyAutoGMX` → **LAGMX** selesai dan terdorong. Repo bersih.
   (`pyAutoGMX` dan `pyautogmx`). Berkas ikut di-rename: `LAGMX.py`,
   `run_matrix/run_lagmx.sh`.
 - Judul naskah JOSS dan `CITATION.cff` (title, repository-code, url) mengikuti.
-- Repo GitHub di-rename ke `laode-aman-ung/LAGMX`; GitHub mengalihkan URL lama
+- Repo GitHub di-rename ke `laode-aman-ung/lagmx`; GitHub mengalihkan URL lama
   sehingga tautan yang sudah tersebar tetap hidup.
 - Folder lokal pindah ke `~/riset/LAGMX`, mengikuti pola path identik lintas
   mesin.
