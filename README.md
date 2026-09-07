@@ -1,5 +1,7 @@
 # LAGMX
 
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.22642117.svg)](https://doi.org/10.5281/zenodo.22642117)
+
 Automated preparation and simulation of single- and multi-ligand protein
 complexes in GROMACS.
 
@@ -389,7 +391,16 @@ that is reproducible for any number of ligands and any number of complexes.
 
 ## Citation
 
-If you use LAGMX, please also cite the tools it wraps:
+**To cite LAGMX:**
+
+> Aman LO (2026). *LAGMX* [Computer software]. Zenodo.
+> https://doi.org/10.5281/zenodo.22642117
+
+That DOI always resolves to the latest release. To cite the exact version
+you ran — which is what a reproducible methods section needs — use the
+version DOI shown on that Zenodo record instead.
+
+**Please also cite the tools LAGMX wraps:**
 
 - Abraham, M.J. et al. GROMACS. *SoftwareX* 1-2, 19-25 (2015).
 - Wang, J. et al. Development and testing of a general Amber force field.
