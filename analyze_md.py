@@ -74,7 +74,7 @@ ANALYSIS_DEFAULTS = {
     "mmpbsa_method": "gb",            # gb, pb, or both
     "mmpbsa_frames": "100",           # target frame count, if no interval given
     "mmpbsa_interval": "",            # explicit frame stride; overrides the target
-    "mmpbsa_np": "1",                 # MPI ranks for gmx_MMPBSA; 1 = serial
+    "mmpbsa_np": "0",                 # MPI ranks for gmx_MMPBSA; 0 = auto
     "mmpbsa_igb": "5",
     "mmpbsa_salt": "0.150",
 }
@@ -858,6 +858,21 @@ def _resolve_mmpbsa(setting):
     return None
 
 
+def _auto_mmpbsa_np(n_frames):
+    """Rank count to use when mmpbsa_np is 0.
+
+    gmx_MMPBSA splits frames across ranks, so more ranks than frames is waste.
+    Half the machine's cores, capped at eight, and never above the frame count --
+    the same rule LADEEP's worker applies, so the two agree on any machine and
+    not only on a large one.
+
+    Capped rather than uncapped because the scaling flattens: the ranks share
+    one filesystem and one trajectory reader, and past eight the coordination
+    costs more than the extra parallelism returns.
+    """
+    return max(1, min(n_frames, max(1, (os.cpu_count() or 4) // 2), 8))
+
+
 def _resolve_mpirun(mmpbsa_exe):
     """mpirun from the same environment as gmx_MMPBSA, or None.
 
@@ -977,7 +992,9 @@ def _run_one_mmpbsa(ctx, exe, label, group_num, total, interval, method):
            "-o", ctx["a"](f"mmpbsa_{label}.dat"),
            "-eo", ctx["a"](f"mmpbsa_{label}.csv"), "-nogui"]
     # Frames are the unit of work, so more ranks than frames is waste.
-    nprocs = max(1, min(int(ctx.get("mmpbsa_np", 1) or 1), total))
+    requested = int(ctx.get("mmpbsa_np", 0) or 0)
+    nprocs = requested if requested > 0 else _auto_mmpbsa_np(total)
+    nprocs = max(1, min(nprocs, total))
     if nprocs > 1:
         launcher = _resolve_mpirun(exe)
         if launcher:

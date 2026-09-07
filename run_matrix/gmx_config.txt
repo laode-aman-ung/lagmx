@@ -200,19 +200,29 @@ mmpbsa_method: gb
 mmpbsa_interval: 250
 mmpbsa_frames: 100
 
-# Berapa proses MPI untuk gmx_MMPBSA. 1 = serial.
+# Berapa proses MPI untuk gmx_MMPBSA. 0 = otomatis.
 #
 # gmx_MMPBSA membagi *frame* antar rank, jadi ini satu-satunya tuas yang membuat
 # tahap ini selesai lebih cepat — dan tahap ini yang termahal. Diukur pada satu
 # kompleks ThiM 75.852 atom dengan 181 frame: 98 menit serial, di mesin yang 40
 # core-nya menganggur.
 #
-# Lebih banyak rank daripada frame hanya pemborosan; skrip membatasinya sendiri.
+# 0 berarti skrip menentukan sendiri: separuh core mesin, dibatasi 8, dan tidak
+# pernah melebihi jumlah frame. Aturan yang sama dipakai worker LADEEP, jadi
+# konfigurasi yang dipindah antara keduanya berperilaku sama di mesin apa pun.
+#
+# Dibatasi 8 dan bukan dibiarkan bebas karena penskalaannya mendatar: semua rank
+# berbagi satu pembaca lintasan dan satu sistem berkas, dan di atas delapan
+# biaya koordinasinya melebihi tambahan paralelismenya.
+#
+# Isi angka eksplisit untuk memaksa, misalnya 8. Nilai lebih besar dari jumlah
+# frame hanya pemborosan; skrip membatasinya sendiri.
+#
 # `mpirun` diambil dari environment gmx_MMPBSA (mmpbsa_python), bukan dari PATH
 # sistem: mencampur launcher sistem dengan mpi4py bawaan conda menghasilkan rank
 # yang semuanya mengira dirinya rank 0, sehingga frame yang sama dihitung
 # berulang tanpa satu pun pesan galat.
-mmpbsa_np: 1
+mmpbsa_np: 0
 
 # Model Generalized Born (igb) dan konsentrasi garam dalam M.
 mmpbsa_igb: 5
