@@ -938,13 +938,26 @@ def _resolve_mpirun(mmpbsa_exe):
 
 
 def _frame_count(ctx):
-    """Number of frames in the prepared trajectory, via the RMSD trace if it
-    exists (cheap) and gmx check otherwise."""
+    """Number of frames in the prepared trajectory.
+
+    The RMSD trace is a cheap proxy for it -- one row per frame -- but only
+    when RMSD was written without thinning. It was not: analysis_stride_rmsd
+    defaults to 5, so the trace held 9001 rows for a 45001-frame trajectory
+    and this returned a fifth of the real count. gmx_MMPBSA then received
+    endframe=9001 for a trajectory five times longer and sampled the first
+    18 ns of a 90 ns window instead of all of it -- a legitimate calculation
+    over the wrong span, with nothing to show that anything was wrong.
+
+    The row count is still usable; it just has to be scaled back by the
+    stride that produced it. gmx check remains the fallback and reads the
+    whole trajectory, which is why it is not the first resort.
+    """
     rmsd = ctx["a"]("rmsd_protein.xvg")
     if os.path.exists(rmsd):
         data, _ = read_xvg(rmsd)
         if data.size:
-            return len(data)
+            stride = max(1, int(ctx.get("strides", {}).get("rmsd", 1) or 1))
+            return (len(data) - 1) * stride + 1
     ok, out = gmx_run(["check", "-f", ctx["xtc"]], cwd=ctx["cdir"])
     m = re.search(r"Step\s+(\d+)", out or "")
     return int(m.group(1)) if m else 0

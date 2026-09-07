@@ -237,3 +237,25 @@ def test_mmpbsa_reads_the_delta_row_not_the_ligand(tmp_path):
 def test_mmpbsa_missing_file_is_empty_not_an_error():
     am = _load_analyze_md()
     assert am.parse_mmpbsa_dat("/nonexistent/mmpbsa.dat") == {}
+
+
+def test_frame_count_scales_back_the_rmsd_stride(tmp_path, monkeypatch):
+    """The RMSD trace is one row per frame only when RMSD kept every frame.
+    analysis_stride_rmsd defaults to 5, so counting its rows returned a fifth
+    of the trajectory, and gmx_MMPBSA was handed an endframe five times too
+    small -- sampling the first 18 ns of a 90 ns window, correctly, silently,
+    and over the wrong span."""
+    am = _load_analyze_md()
+    xvg = tmp_path / "rmsd_protein.xvg"
+    # 9001 rows, as a stride-5 trace of a 45001-frame trajectory would hold.
+    xvg.write_text('@ xaxis label "Time (ns)"\n' +
+                   "".join(f"{10 + i * 0.01:.2f} 0.2\n" for i in range(9001)))
+
+    ctx = {"a": lambda name: str(tmp_path / name),
+           "cdir": str(tmp_path),
+           "xtc": str(tmp_path / "md_center.xtc"),
+           "strides": {"rmsd": 5}}
+    assert am._frame_count(ctx) == 45001
+
+    ctx["strides"] = {"rmsd": 1}
+    assert am._frame_count(ctx) == 9001, "an unthinned trace must not be scaled"
