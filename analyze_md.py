@@ -375,6 +375,52 @@ def stride_args(ctx, key, tu="ps"):
 PREP_RECIPE = 2
 
 
+def build_reference_tpr(cdir, adir, tpr):
+    """A .tpr whose coordinates match the prepared trajectory.
+
+    Every fitting analysis -- rms, covar, anaeig -- superimposes each frame on
+    the structure held in the file given to -s. That file was md.tpr, whose
+    coordinates are the raw ones grompp was handed: molecules split across the
+    boundary and, for a multimer, protomers in different periodic images. The
+    trajectory is corrected and the reference is not, and no rigid-body
+    superposition can reconcile the two.
+
+    Measured on the ThiM trimer: backbone RMSD came out at 3.56 nm against
+    md.tpr and 0.222 nm against a reference built from the prepared first frame.
+    The first number is stable, plausible-looking, and meaningless -- it is the
+    size of a box vector, not a conformational change. This predates the
+    nojump/cluster fix and affected every RMSD, RMSF and PCA produced here.
+
+    A plain .pdb cannot serve as -s: gmx needs masses for the least-squares fit
+    and a PDB carries none for ligand atoms. So grompp rebuilds a real .tpr from
+    start.pdb, with the same topology and the same atom count.
+
+    Returns the reference to use; falls back to the original tpr, saying so,
+    rather than failing the whole analysis.
+    """
+    start = os.path.join(adir, "start.pdb")
+    ref = os.path.join(adir, "ref.tpr")
+    if not os.path.exists(start):
+        return tpr
+    if os.path.exists(ref) and os.path.getmtime(ref) >= os.path.getmtime(start):
+        return ref
+
+    mdp = os.path.join(cdir, "md.mdp")
+    top = os.path.join(cdir, "topol.top")
+    if not (os.path.exists(mdp) and os.path.exists(top)):
+        say("md.mdp or topol.top missing; fitting against the raw tpr", 6)
+        return tpr
+    ok, out = gmx_run(["grompp", "-f", mdp, "-c", start, "-p", top,
+                       "-n", os.path.join(adir, "analysis.ndx"),
+                       "-o", ref, "-maxwarn", "10"], cwd=cdir)
+    if not ok or not os.path.exists(ref):
+        tail = out.strip().splitlines()[-1] if out.strip() else "?"
+        say(f"reference tpr could not be built ({tail}); fitting against the raw tpr", 6)
+        return tpr
+    say("reference tpr rebuilt from the prepared first frame", 6)
+    return ref
+
+
 def prepare_trajectory(cdir, adir, tpr, xtc, groups, merged_group, skip_ps):
     """Undo periodic boundary artefacts before anything is measured.
 
@@ -1108,8 +1154,11 @@ def analyse_complex(cdir, cfg, requested):
         say("stride: " + ", ".join(f"{k} 1/{v}" for k, v in thinned.items())
             + f" (frame {frame_ps:g} ps)", 6)
 
+    # Fit against coordinates that match the trajectory, not the raw ones.
+    ref_tpr = build_reference_tpr(cdir, adir, tpr)
+
     ctx = {
-        "cdir": cdir, "adir": adir, "tpr": tpr, "xtc": prepared,
+        "cdir": cdir, "adir": adir, "tpr": ref_tpr, "xtc": prepared,
         "ndx": os.path.join(adir, "analysis.ndx"), "groups": groups,
         "a": lambda f: os.path.join(adir, f),
         "strides": strides, "frame_ps": frame_ps,
